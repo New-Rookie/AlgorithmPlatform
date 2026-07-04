@@ -1,0 +1,27 @@
+sop_id: sop_assembly101
+name: Assembly101 pseudo SOP
+thresholds:
+  confirm_confidence: 0.70
+  uncertain_confidence: 0.55
+  smoothing_window: 3
+steps:
+  - id: S01
+    name: prepare_or_idle
+    actions: [idle, prepare, start, wait]
+    required: false
+  - id: S02
+    name: take_part
+    actions: [take, pick, pick_up, grab]
+    required: true
+  - id: S03
+    name: place_or_align
+    actions: [place, align, position]
+    required: true
+  - id: S04
+    name: assemble_or_connect
+    actions: [assemble, connect, insert, attach, screw, fix]
+    required: true
+  - id: S05
+    name: inspect_or_finish
+    actions: [inspect, check, finish, complete, done]
+    required: false
