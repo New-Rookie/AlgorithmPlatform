@@ -1,0 +1,38 @@
+dataset:
+  name: assembly101
+
+paths:
+  annotations: data/raw/assembly101/annotations.csv
+  videos_root: data/raw/assembly101/videos
+  output_dir: data/processed/assembly101
+
+columns:
+  video: video_path
+  start: start
+  end: end
+  label: action
+  split: null
+  station: null
+
+subset:
+  # Replace these labels with real labels from inspect_dataset.py output.
+  labels: []
+  max_recordings: 80
+  max_rows: 12000
+  min_clips_per_recording: 10
+  balanced: true
+  require_existing_videos: true
+
+metadata:
+  sop_id: sop_assembly101
+  employee_id: emp_public
+
+split:
+  val_size: 0.15
+  test_size: 0.10
+  seed: 42
+
+outputs:
+  annotation_summary: outputs/dataset/annotation_summary.csv
+  selected_recordings: outputs/dataset/selected_recordings.txt
+  selected_recordings_summary: outputs/dataset/selected_recordings_summary.csv
