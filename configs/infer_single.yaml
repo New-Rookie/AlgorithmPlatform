@@ -1,0 +1,23 @@
+paths:
+  model_dir: outputs/checkpoints/videomae_assembly_v1
+  video_path: data/demo/single_video.mp4
+  output_csv: outputs/inference/single_predictions.csv
+  event_jsonl: outputs/events/single_events.jsonl
+  clip_dir: outputs/clips
+
+runtime:
+  device: auto
+  num_frames: 16
+  window_seconds: 3.0
+  stride_seconds: 0.5
+  batch_size: 4
+  save_event_clips: true
+  pre_event_seconds: 10
+  post_event_seconds: 10
+
+station:
+  station_id: station_001
+  employee_id: emp_001
+  sop_id: sop_basic
+
+sop_config: configs/sop_basic.yaml
