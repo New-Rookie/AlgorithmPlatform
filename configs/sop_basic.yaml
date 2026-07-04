@@ -1,0 +1,37 @@
+sop_id: sop_basic
+name: Public assembly pseudo SOP
+thresholds:
+  confirm_confidence: 0.70
+  uncertain_confidence: 0.55
+  smoothing_window: 3
+steps:
+  - id: S01
+    name: prepare_or_idle
+    actions: [idle, prepare, start, wait]
+    min_duration: 0.5
+    max_duration: 20.0
+    required: false
+  - id: S02
+    name: take_part
+    actions: [take, pick, pick_up, grab]
+    min_duration: 0.5
+    max_duration: 20.0
+    required: true
+  - id: S03
+    name: place_or_align
+    actions: [place, align, position]
+    min_duration: 0.5
+    max_duration: 30.0
+    required: true
+  - id: S04
+    name: assemble_or_connect
+    actions: [assemble, connect, insert, attach, screw, fix]
+    min_duration: 0.5
+    max_duration: 60.0
+    required: true
+  - id: S05
+    name: inspect_or_finish
+    actions: [inspect, check, finish, complete, done]
+    min_duration: 0.5
+    max_duration: 30.0
+    required: false
