@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -26,10 +25,50 @@ VIEW_FILES = {
 VIEW_FILES["fixed"] = sorted({x for k, v in VIEW_FILES.items() for x in v if k.startswith("v")})
 VIEW_FILES["all"] = VIEW_FILES["fixed"]
 
-VIDEO_COL_CANDIDATES = ["video_path", "video", "video_name", "recording", "recording_name", "path", "filename"]
-START_COL_CANDIDATES = ["start", "start_time", "start_sec", "start_frame", "t_start"]
-END_COL_CANDIDATES = ["end", "end_time", "end_sec", "end_frame", "t_end"]
-LABEL_COL_CANDIDATES = ["action", "label", "action_label", "verb", "coarse_label", "fine_label", "class"]
+VIDEO_COL_CANDIDATES = [
+    "video_path",
+    "video",
+    "video_name",
+    "recording",
+    "recording_name",
+    "recording_id",
+    "video_id",
+    "path",
+    "filename",
+]
+START_COL_CANDIDATES = [
+    "start",
+    "start_time",
+    "start_sec",
+    "start_second",
+    "start_frame",
+    "start_frames",
+    "start_timestamp",
+    "t_start",
+]
+END_COL_CANDIDATES = [
+    "end",
+    "end_time",
+    "end_sec",
+    "end_second",
+    "end_frame",
+    "end_frames",
+    "end_timestamp",
+    "t_end",
+]
+LABEL_COL_CANDIDATES = [
+    "action",
+    "label",
+    "action_label",
+    "action_cls",
+    "action_id",
+    "verb",
+    "verb_cls",
+    "verb_id",
+    "coarse_label",
+    "fine_label",
+    "class",
+]
 
 
 def read_yaml(path: str) -> Dict:
@@ -42,18 +81,7 @@ def write_yaml(path: str, data: Dict) -> None:
         yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
 
 
-def find_first_file(root: Path, suffixes=(".csv", ".txt")) -> Optional[Path]:
-    files = []
-    for suffix in suffixes:
-        files.extend(root.rglob(f"*{suffix}"))
-    files = [p for p in files if p.is_file()]
-    if not files:
-        return None
-    csv_files = [p for p in files if p.suffix.lower() == ".csv"]
-    return sorted(csv_files or files, key=lambda p: len(str(p)))[0]
-
-
-def infer_column(columns: List[str], candidates: List[str], role: str) -> str:
+def try_infer_column(columns: List[str], candidates: List[str]) -> Optional[str]:
     lower_map = {c.lower(): c for c in columns}
     for cand in candidates:
         if cand.lower() in lower_map:
@@ -63,7 +91,75 @@ def infer_column(columns: List[str], candidates: List[str], role: str) -> str:
         for cand in candidates:
             if cand.lower() in cl:
                 return c
-    raise ValueError(f"Cannot infer {role} column. Available columns: {columns}")
+    return None
+
+
+def infer_column(columns: List[str], candidates: List[str], role: str) -> str:
+    col = try_infer_column(columns, candidates)
+    if col is None:
+        raise ValueError(f"Cannot infer {role} column. Available columns: {columns}")
+    return col
+
+
+def is_frame_column(name: str) -> bool:
+    return "frame" in str(name).lower()
+
+
+def find_annotation_table(ann_root: Path, explicit_file: Optional[str] = None) -> Tuple[Path, Dict[str, str]]:
+    """Find a real segment annotation table, not a class dictionary.
+
+    Assembly101 contains files such as actions.csv that only map action ids to
+    labels. Those files do not have video/start/end columns and must be skipped.
+    """
+    if explicit_file:
+        candidates = [Path(explicit_file)]
+    else:
+        candidates = sorted(ann_root.rglob("*.csv"), key=lambda p: (len(p.parts), str(p)))
+
+    inspected = []
+    viable = []
+    for path in candidates:
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            sample = pd.read_csv(path, nrows=50)
+        except Exception as exc:
+            inspected.append((str(path), f"read_error={exc}"))
+            continue
+        columns = list(sample.columns)
+        video_col = try_infer_column(columns, VIDEO_COL_CANDIDATES)
+        start_col = try_infer_column(columns, START_COL_CANDIDATES)
+        end_col = try_infer_column(columns, END_COL_CANDIDATES)
+        label_col = try_infer_column(columns, LABEL_COL_CANDIDATES)
+        inspected.append((str(path), columns))
+        if video_col and start_col and end_col and label_col:
+            # Prefer files with more rows and with explicit video/recording fields.
+            try:
+                row_count = sum(1 for _ in open(path, "r", encoding="utf-8", errors="ignore")) - 1
+            except Exception:
+                row_count = 0
+            score = row_count
+            if "coarse" in str(path).lower():
+                score += 1000
+            if "action" in str(path).lower():
+                score += 100
+            viable.append((score, path, {"video": video_col, "start": start_col, "end": end_col, "label": label_col}))
+
+    if not viable:
+        lines = ["Could not find a segment annotation CSV with video/start/end/label columns."]
+        lines.append("Inspected CSV files:")
+        for item in inspected[:50]:
+            lines.append(f"- {item[0]}: {item[1]}")
+        lines.append("If you know the correct file, pass --annotation-file <path>.")
+        raise ValueError("\n".join(lines))
+
+    viable = sorted(viable, key=lambda x: x[0], reverse=True)
+    selected = viable[0]
+    print("Candidate annotation tables:")
+    for score, path, cols in viable[:10]:
+        print(f"  score={score} file={path} columns={cols}")
+    print(f"Selected annotation table: {selected[1]}")
+    return selected[1], selected[2]
 
 
 def normalize_recording(value: str) -> str:
@@ -96,25 +192,35 @@ def expand_views(views: str) -> List[str]:
     return sorted(set(result))
 
 
-def download_annotations(local_dir: str) -> Path:
+def download_annotations(local_dir: str, annotation_file: Optional[str] = None) -> Tuple[Path, Dict[str, str]]:
+    if annotation_file:
+        path = Path(annotation_file)
+        if not path.exists():
+            raise FileNotFoundError(f"Annotation file does not exist: {path}")
+        sample = pd.read_csv(path, nrows=50)
+        cols = list(sample.columns)
+        col_map = {
+            "video": infer_column(cols, VIDEO_COL_CANDIDATES, "video"),
+            "start": infer_column(cols, START_COL_CANDIDATES, "start"),
+            "end": infer_column(cols, END_COL_CANDIDATES, "end"),
+            "label": infer_column(cols, LABEL_COL_CANDIDATES, "label"),
+        }
+        return path, col_map
+
     print("[1/5] Downloading annotations only...")
     snapshot_download(
         repo_id=REPO_ID,
         repo_type="dataset",
         local_dir=local_dir,
         allow_patterns=["annotations/*", "annotations/**/*"],
-        resume_download=True,
     )
     ann_root = Path(local_dir) / "annotations"
-    annotation_file = find_first_file(ann_root, suffixes=(".csv",))
-    if annotation_file is None:
-        raise FileNotFoundError(f"No CSV annotation file found under {ann_root}")
-    print(f"Found annotation file: {annotation_file}")
-    return annotation_file
+    return find_annotation_table(ann_root)
 
 
 def select_subset(
     annotation_file: Path,
+    detected_col_map: Dict[str, str],
     num_labels: int,
     max_recordings: int,
     min_clips_per_recording: int,
@@ -122,11 +228,10 @@ def select_subset(
 ) -> Tuple[pd.DataFrame, Dict[str, str], List[str], List[str]]:
     print("[2/5] Inspecting annotations and selecting subset...")
     df = pd.read_csv(annotation_file)
-    columns = list(df.columns)
-    video_col = infer_column(columns, VIDEO_COL_CANDIDATES, "video")
-    start_col = infer_column(columns, START_COL_CANDIDATES, "start")
-    end_col = infer_column(columns, END_COL_CANDIDATES, "end")
-    label_col = infer_column(columns, LABEL_COL_CANDIDATES, "label")
+    video_col = detected_col_map["video"]
+    start_col = detected_col_map["start"]
+    end_col = detected_col_map["end"]
+    label_col = detected_col_map["label"]
 
     df = df.copy()
     df[label_col] = df[label_col].astype(str)
@@ -154,6 +259,8 @@ def select_subset(
 
     selected = filtered[filtered["recording_name"].isin(recordings)].reset_index(drop=True)
     col_map = {"video": video_col, "start": start_col, "end": end_col, "label": label_col}
+    print(f"Annotation file: {annotation_file}")
+    print(f"Detected columns: {col_map}")
     print(f"Selected labels: {labels}")
     print(f"Selected recordings: {len(recordings)}")
     print(f"Selected annotation rows before video filtering: {len(selected)}")
@@ -178,8 +285,14 @@ def download_videos(local_dir: str, recordings: List[str], view_files: List[str]
         repo_type="dataset",
         local_dir=local_dir,
         allow_patterns=patterns,
-        resume_download=True,
     )
+
+
+def as_seconds(series: pd.Series, column_name: str, fps: float) -> pd.Series:
+    values = series.astype(float)
+    if is_frame_column(column_name):
+        return values / float(fps)
+    return values
 
 
 def build_manifest(
@@ -193,13 +306,14 @@ def build_manifest(
     max_rows: int,
     balanced: bool,
     seed: int,
+    fps: float,
 ) -> None:
     print("[4/5] Building manifest.csv...")
     out = pd.DataFrame()
     out["recording_name"] = selected["recording_name"].astype(str)
     out["video_path"] = out["recording_name"].apply(lambda r: resolve_video_path(videos_root, r, view_file))
-    out["start"] = selected[col_map["start"]].astype(float)
-    out["end"] = selected[col_map["end"]].astype(float)
+    out["start"] = as_seconds(selected[col_map["start"]], col_map["start"], fps)
+    out["end"] = as_seconds(selected[col_map["end"]], col_map["end"], fps)
     out["label"] = selected[col_map["label"]].astype(str)
     out["station_id"] = "station_public"
     out["sop_id"] = "sop_assembly101"
@@ -248,12 +362,15 @@ def build_manifest(
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(
             {
+                "annotation_file": str(Path(selected.attrs.get("annotation_file", ""))),
                 "rows": len(out),
                 "videos": out["video_path"].nunique(),
                 "labels": labels_sorted,
                 "splits": out["split"].value_counts().to_dict(),
                 "recordings": recordings,
                 "view_file": view_file,
+                "fps_for_frame_columns": fps,
+                "time_columns": {"start": col_map["start"], "end": col_map["end"]},
             },
             f,
             ensure_ascii=False,
@@ -281,12 +398,14 @@ def main() -> None:
     parser.add_argument("--config", default="configs/dataset_assembly101.yaml")
     parser.add_argument("--local-dir", default="data/raw/assembly101")
     parser.add_argument("--output-dir", default="data/processed/assembly101")
+    parser.add_argument("--annotation-file", default=None, help="Optional explicit segment annotation CSV. If omitted, the script scans annotations/*.csv and selects a viable segment table.")
     parser.add_argument("--views", default="v1", help="v1-v8, fixed, all, or exact mp4 filename; start with v1")
     parser.add_argument("--num-labels", type=int, default=6, help="Auto-select top N labels when --labels is not provided")
     parser.add_argument("--labels", default=None, help="Optional comma-separated labels to force")
     parser.add_argument("--max-recordings", type=int, default=80)
     parser.add_argument("--max-rows", type=int, default=12000)
     parser.add_argument("--min-clips-per-recording", type=int, default=10)
+    parser.add_argument("--fps", type=float, default=30.0, help="FPS used when annotation time columns are frame indices")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dry-run", action="store_true", help="Download annotations, select subset, print video patterns, but do not download videos or build manifest")
     args = parser.parse_args()
@@ -296,15 +415,17 @@ def main() -> None:
         print("Warning: manifest will use the first view file only. Multiple-view training is not implemented in V1.")
     manifest_view_file = view_files[0]
 
-    annotation_file = download_annotations(args.local_dir)
+    annotation_file, detected_col_map = download_annotations(args.local_dir, annotation_file=args.annotation_file)
     preferred_labels = [x.strip() for x in args.labels.split(",") if x.strip()] if args.labels else None
     selected, col_map, labels, recordings = select_subset(
         annotation_file=annotation_file,
+        detected_col_map=detected_col_map,
         num_labels=args.num_labels,
         max_recordings=args.max_recordings,
         min_clips_per_recording=args.min_clips_per_recording,
         preferred_labels=preferred_labels,
     )
+    selected.attrs["annotation_file"] = str(annotation_file)
     download_videos(args.local_dir, recordings, view_files, dry_run=args.dry_run)
     if args.dry_run:
         return
@@ -319,6 +440,7 @@ def main() -> None:
         max_rows=args.max_rows,
         balanced=True,
         seed=args.seed,
+        fps=args.fps,
     )
     patch_dataset_config(args.config, annotation_file, labels)
     print("Done. Next: python scripts/train.py --config configs/train.yaml")
