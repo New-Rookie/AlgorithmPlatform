@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import random
+from pathlib import Path
 from typing import Dict, Optional
 
 import numpy as np
@@ -16,8 +17,8 @@ try:
 except ImportError:  # pragma: no cover
     from transformers import AdamW
 
-from src.algorithm_platform.data.manifest import build_label_maps, load_manifest, save_label_maps
-from src.algorithm_platform.data.video import sample_video_clip
+from algorithm_platform.data.manifest import build_label_maps, load_manifest, save_label_maps
+from algorithm_platform.data.video import sample_video_clip
 
 
 class AssemblyClipDataset(Dataset):
@@ -36,6 +37,7 @@ class AssemblyClipDataset(Dataset):
         self.processor = processor
         self.label2id = label2id
         self.num_frames = num_frames
+        self.split = split
 
     def __len__(self):
         return len(self.df)
@@ -58,7 +60,8 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def evaluate(model, loader, device):
@@ -79,7 +82,21 @@ def evaluate(model, loader, device):
     return {"loss": float(np.mean(losses)) if losses else None, "accuracy": correct / max(total, 1)}
 
 
+def _validate_before_training(manifest_path: str, output_dir: str) -> None:
+    if not Path(manifest_path).exists():
+        raise FileNotFoundError(
+            f"Manifest not found: {manifest_path}\n"
+            "Run dataset bootstrap first, for example:\n"
+            "python scripts/bootstrap_assembly101.py --views v1 --max-recordings 80 --max-rows 12000 --num-labels 6"
+        )
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+
 def train(cfg):
+    print("=" * 80, flush=True)
+    print("AlgorithmPlatform Training Start", flush=True)
+    print("=" * 80, flush=True)
+
     seed = int(cfg.raw.get("seed", 42))
     set_seed(seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -87,12 +104,30 @@ def train(cfg):
     manifest_path = cfg["paths"]["manifest"]
     output_dir = cfg["paths"]["output_dir"]
     num_frames = int(cfg["model"].get("num_frames", 16))
+    _validate_before_training(manifest_path, output_dir)
+
+    print(f"Manifest: {manifest_path}", flush=True)
+    print(f"Output dir: {output_dir}", flush=True)
+    print(f"Model: {cfg['model']['name']}", flush=True)
+    print(f"Device: {device}", flush=True)
+    if torch.cuda.is_available():
+        print(f"CUDA device: {torch.cuda.get_device_name(0)}", flush=True)
+    print(f"Num frames: {num_frames}", flush=True)
 
     all_df = load_manifest(manifest_path)
-    label_maps = build_label_maps(all_df)
-    os.makedirs(output_dir, exist_ok=True)
-    save_label_maps(label_maps, output_dir)
+    if len(all_df) == 0:
+        raise ValueError(f"Manifest has zero rows: {manifest_path}")
+    print(f"Total manifest rows: {len(all_df)}", flush=True)
+    print(f"Split counts: {all_df['split'].value_counts().to_dict()}", flush=True)
+    print(f"Label counts: {all_df['label'].value_counts().head(20).to_dict()}", flush=True)
 
+    label_maps = build_label_maps(all_df)
+    if len(label_maps.label2id) < 2:
+        raise ValueError(f"Need at least 2 labels to train a classifier. Found: {label_maps.label2id}")
+    save_label_maps(label_maps, output_dir)
+    print(f"Labels: {label_maps.label2id}", flush=True)
+
+    print("Loading processor and model...", flush=True)
     processor = VideoMAEImageProcessor.from_pretrained(cfg["model"]["name"])
     model = VideoMAEForVideoClassification.from_pretrained(
         cfg["model"]["name"],
@@ -102,11 +137,13 @@ def train(cfg):
         ignore_mismatched_sizes=bool(cfg["model"].get("ignore_mismatched_sizes", True)),
     ).to(device)
 
+    train_split = cfg["data"].get("train_split", "train")
+    val_split = cfg["data"].get("val_split", "val")
     train_ds = AssemblyClipDataset(
         manifest_path=manifest_path,
         processor=processor,
         label2id=label_maps.label2id,
-        split=cfg["data"].get("train_split", "train"),
+        split=train_split,
         num_frames=num_frames,
         max_samples=cfg["data"].get("max_train_samples"),
     )
@@ -114,10 +151,17 @@ def train(cfg):
         manifest_path=manifest_path,
         processor=processor,
         label2id=label_maps.label2id,
-        split=cfg["data"].get("val_split", "val"),
+        split=val_split,
         num_frames=num_frames,
         max_samples=cfg["data"].get("max_val_samples"),
     )
+
+    print(f"Train rows ({train_split}): {len(train_ds)}", flush=True)
+    print(f"Val rows ({val_split}): {len(val_ds)}", flush=True)
+    if len(train_ds) == 0:
+        raise ValueError(
+            f"Training split is empty: {train_split}. Check manifest split column: {manifest_path}"
+        )
 
     train_loader = DataLoader(
         train_ds,
@@ -149,6 +193,9 @@ def train(cfg):
     metrics_path = os.path.join(output_dir, "train_metrics.jsonl")
     scaler = torch.cuda.amp.GradScaler(enabled=bool(cfg["training"].get("mixed_precision", True)) and torch.cuda.is_available())
     grad_accum = int(cfg["training"].get("gradient_accumulation_steps", 1))
+
+    print("Starting training loop...", flush=True)
+    print(f"Epochs: {cfg['training']['epochs']} | Batches per epoch: {len(train_loader)} | Grad accumulation: {grad_accum}", flush=True)
 
     global_step = 0
     best_acc = -1.0
@@ -182,7 +229,7 @@ def train(cfg):
         }
         with open(metrics_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        print(record)
+        print(record, flush=True)
 
         model.save_pretrained(os.path.join(output_dir, f"epoch_{epoch + 1}"))
         processor.save_pretrained(os.path.join(output_dir, f"epoch_{epoch + 1}"))
@@ -191,7 +238,6 @@ def train(cfg):
             model.save_pretrained(output_dir)
             processor.save_pretrained(output_dir)
 
-    # Always save final model to output_dir even when there is no validation split.
     model.save_pretrained(output_dir)
     processor.save_pretrained(output_dir)
-    print(f"Training finished. Model saved to: {output_dir}")
+    print(f"Training finished. Model saved to: {output_dir}", flush=True)
